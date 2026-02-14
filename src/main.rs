@@ -2,6 +2,7 @@ mod buffer_file;
 mod display;
 mod editor;
 mod sidebar;
+mod syntax;
 mod welcome;
 mod workspace;
 

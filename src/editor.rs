@@ -27,6 +27,11 @@ pub struct Editor {
     show_welcome: bool,
     search_mode: bool,
     search_query: String,
+    // Search state for save/restore
+    search_saved_row: u16,
+    search_saved_col: u16,
+    search_saved_initial_row: u16,
+    search_saved_initial_col: u16,
 }
 
 impl Editor {
@@ -48,6 +53,10 @@ impl Editor {
             show_welcome,
             search_mode: false,
             search_query: String::new(),
+            search_saved_row: 0,
+            search_saved_col: 0,
+            search_saved_initial_row: 0,
+            search_saved_initial_col: 0,
         }
     }
 
@@ -122,7 +131,12 @@ impl Editor {
                                     if self.workspace.has_files() {
                                         self.search_mode = true;
                                         self.search_query.clear();
-                                        self.render_search_prompt()?;
+                                        // Save current position
+                                        let (sc, sr) = cursor::position()?;
+                                        self.search_saved_col = sc;
+                                        self.search_saved_row = sr;
+                                        self.search_saved_initial_row = self.display.initial_row;
+                                        self.search_saved_initial_col = self.display.initial_column;
                                     }
                                     continue;
                                 }
@@ -183,6 +197,11 @@ impl Editor {
 
             self.update_status();
             self.render();
+
+            // Draw search bar on top of status bar when in search mode
+            if self.search_mode {
+                self.render_search_bar().ok();
+            }
         }
 
         terminal::disable_raw_mode()?;
@@ -518,31 +537,35 @@ impl Editor {
     fn handle_search_input(&mut self, key: KeyEvent) -> io::Result<bool> {
         match key.code {
             KeyCode::Esc => {
+                // Restore original position
                 self.search_mode = false;
                 self.search_query.clear();
+                self.display.set_initial_row(self.search_saved_initial_row);
+                self.display
+                    .set_initial_column(self.search_saved_initial_col);
                 self.sync_display();
                 self.render();
+                execute!(
+                    io::stdout(),
+                    cursor::MoveTo(self.search_saved_col, self.search_saved_row)
+                )?;
                 return Ok(true);
             }
             KeyCode::Enter => {
+                // Navigate to next match
+                if !self.search_query.is_empty() {
+                    self.navigate_to_next_match()?;
+                }
                 self.search_mode = false;
                 // Keep search_query for highlighting
-                self.sync_display();
-                self.render();
                 return Ok(true);
             }
             KeyCode::Char(c) => {
                 self.search_query.push(c);
-                self.render_search_prompt()?;
-                self.sync_display();
-                self.render();
                 return Ok(true);
             }
             KeyCode::Backspace => {
                 self.search_query.pop();
-                self.render_search_prompt()?;
-                self.sync_display();
-                self.render();
                 return Ok(true);
             }
             _ => {}
@@ -550,33 +573,125 @@ impl Editor {
         Ok(true)
     }
 
-    fn render_search_prompt(&self) -> io::Result<()> {
+    fn navigate_to_next_match(&mut self) -> io::Result<()> {
+        let query: Vec<char> = self.search_query.to_lowercase().chars().collect();
+        if query.is_empty() {
+            return Ok(());
+        }
+
+        let buf = match self.workspace.active() {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+
+        // Current position
+        let (_cur_col_pos, cur_row_pos) = cursor::position()?;
+        let current_row = self.display.get_absolute_row(cur_row_pos) as usize;
+        let current_col = self.display.get_cursor_position() as usize;
+
+        // Search from current position forward, wrap around
+        let total_lines = buf.file_matrix.len();
+        let search_col = current_col + 1; // start after current position
+
+        for offset in 0..total_lines {
+            let row_idx = (current_row + offset) % total_lines;
+            let line = &buf.file_matrix[row_idx];
+            let line_lower: Vec<char> = line.iter().flat_map(|c| c.to_lowercase()).collect();
+
+            let start_col = if offset == 0 { search_col } else { 0 };
+
+            // Search within this line
+            let qlen = query.len();
+            if line_lower.len() >= qlen {
+                for col in start_col..=line_lower.len().saturating_sub(qlen) {
+                    let matches = (0..qlen).all(|k| line_lower[col + k] == query[k]);
+                    if matches {
+                        // Found match at (row_idx, col)
+                        self.jump_to_position(row_idx as u16, col as u16)?;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn jump_to_position(&mut self, file_row: u16, file_col: u16) -> io::Result<()> {
+        let content_rows = self.display.rows.saturating_sub(2);
+        let sidebar_w = self
+            .sidebar
+            .as_ref()
+            .map(|s| s.sidebar_offset())
+            .unwrap_or(0);
+        let line_nr_w = self.display.offset_lines_number() as u16;
+        let text_offset = sidebar_w + line_nr_w;
+        let content_w = self.display.content_width().saturating_sub(line_nr_w);
+
+        // Set initial_row so the target line is visible
+        if file_row < self.display.initial_row
+            || file_row >= self.display.initial_row + content_rows
+        {
+            // Center the target row
+            let half = content_rows / 2;
+            self.display.set_initial_row(file_row.saturating_sub(half));
+        }
+
+        // Set initial_column so the target column is visible
+        if file_col < self.display.initial_column
+            || file_col >= self.display.initial_column + content_w
+        {
+            self.display.set_initial_column(file_col.saturating_sub(5));
+        }
+
+        // Calculate screen position
+        let screen_row = 1 + file_row.saturating_sub(self.display.initial_row);
+        let screen_col = text_offset + file_col.saturating_sub(self.display.initial_column);
+
+        self.sync_display();
+        self.render();
+        execute!(io::stdout(), cursor::MoveTo(screen_col, screen_row))?;
+
+        Ok(())
+    }
+
+    fn render_search_bar(&self) -> io::Result<()> {
         let (columns, rows) = terminal::size()?;
-        let prompt = format!(" Buscar: {}", self.search_query);
+        let sidebar_w = self
+            .sidebar
+            .as_ref()
+            .map(|s| if s.visible { s.width } else { 0 })
+            .unwrap_or(0);
+        let start_col = sidebar_w;
+        let width = columns.saturating_sub(sidebar_w) as usize;
+        let prompt = format!(" Buscar: {}█", self.search_query);
+
+        let bg = style::Color::Rgb {
+            r: 25,
+            g: 35,
+            b: 50,
+        };
+        let fg = style::Color::Rgb {
+            r: 200,
+            g: 220,
+            b: 255,
+        };
+
+        // Pad to width
+        let prompt_chars: Vec<char> = prompt.chars().collect();
+        let mut padded = String::with_capacity(width);
+        for i in 0..width {
+            padded.push(prompt_chars.get(i).copied().unwrap_or(' '));
+        }
 
         execute!(
             io::stdout(),
-            cursor::MoveTo(0, rows - 1),
-            style::SetBackgroundColor(style::Color::Rgb {
-                r: 25,
-                g: 35,
-                b: 50,
-            }),
-            style::SetForegroundColor(style::Color::Rgb {
-                r: 200,
-                g: 220,
-                b: 255,
-            }),
+            cursor::MoveTo(start_col, rows - 1),
+            style::SetBackgroundColor(bg),
+            style::SetForegroundColor(fg),
+            style::Print(&padded),
+            style::ResetColor,
         )?;
-
-        for _ in 0..columns {
-            write!(io::stdout(), " ")?;
-        }
-
-        execute!(io::stdout(), cursor::MoveTo(0, rows - 1))?;
-        write!(io::stdout(), "{}", prompt)?;
-        io::stdout().flush()?;
-        execute!(io::stdout(), style::ResetColor)?;
 
         Ok(())
     }
@@ -695,7 +810,7 @@ impl Editor {
                 Ok(true)
             }
             KeyCode::Right => {
-                self.display.next_column();
+                self.display.next_column(column_position);
                 execute!(io::stdout(), cursor::MoveRight(1))?;
                 Ok(true)
             }
@@ -709,7 +824,7 @@ impl Editor {
                 if column_position > min_col {
                     execute!(io::stdout(), cursor::MoveLeft(1))?;
                 } else {
-                    self.display.previous_column();
+                    self.display.previous_column(column_position);
                 }
                 Ok(true)
             }
@@ -807,7 +922,7 @@ impl Editor {
                     buf.add_char(c, cursor_col, absolute_row);
                     self.display.set_file_matrix(buf.file_matrix.clone());
                 }
-                self.display.next_column();
+                self.display.next_column(column_position);
                 execute!(io::stdout(), cursor::MoveRight(1))?;
             }
             KeyCode::Backspace => {
@@ -827,7 +942,7 @@ impl Editor {
                         self.display.previous_row();
                     }
                 } else if cursor_col > 0 {
-                    self.display.previous_column();
+                    self.display.previous_column(column_position);
                     let sidebar_w = self
                         .sidebar
                         .as_ref()
@@ -871,8 +986,8 @@ impl Editor {
                     }
                     self.display.set_file_matrix(buf.file_matrix.clone());
                 }
-                for _ in 0..4 {
-                    self.display.next_column();
+                for j in 0..4 {
+                    self.display.next_column(column_position + j);
                 }
                 execute!(io::stdout(), cursor::MoveRight(4))?;
             }

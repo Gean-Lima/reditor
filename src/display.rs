@@ -1,4 +1,5 @@
 use crate::sidebar::Sidebar;
+use crate::syntax;
 use crate::welcome::WelcomeScreen;
 use crossterm::style::Color;
 use crossterm::{cursor, execute, queue, style, terminal};
@@ -70,7 +71,7 @@ impl Display {
         self.sidebar_width
     }
 
-    fn content_width(&self) -> u16 {
+    pub fn content_width(&self) -> u16 {
         self.columns.saturating_sub(self.sidebar_width)
     }
 
@@ -112,7 +113,6 @@ impl Display {
         if self.show_welcome {
             let welcome = WelcomeScreen::render(content_w, self.rows);
             for (row_idx, row) in welcome.iter().enumerate() {
-                // Build spans of same color
                 let mut col_idx = 0;
                 while col_idx < row.len() {
                     let screen_col = content_start + col_idx as u16;
@@ -171,15 +171,15 @@ impl Display {
             g: 12,
             b: 10,
         };
-        let fg_text = Color::Rgb {
-            r: 200,
-            g: 200,
-            b: 200,
-        };
         let fg_line_nr = Color::Rgb {
             r: 100,
             g: 100,
             b: 100,
+        };
+        let fg_default = Color::Rgb {
+            r: 200,
+            g: 200,
+            b: 200,
         };
 
         let search_chars: Vec<char> = search_query.unwrap_or("").chars().collect();
@@ -195,11 +195,33 @@ impl Display {
             b: 10,
         };
 
+        // --- Syntax highlighting ---
+        let ext = syntax::get_extension(&self.filename);
+
+        // Build highlight state from line 0 up to visible start (for block comments)
+        let mut hl_state = syntax::HighlightState::new();
+        for row_idx in 0..file_matrix_row_start as usize {
+            if row_idx < self.file_matrix.len() {
+                syntax::highlight_line(&self.file_matrix[row_idx], &ext, &mut hl_state);
+            }
+        }
+
+        // Highlight visible lines
+        let mut highlighted_lines: Vec<Vec<syntax::ColoredChar>> = Vec::new();
+        for row_idx in file_matrix_row_start as usize..file_matrix_row_end as usize {
+            if row_idx < self.file_matrix.len() {
+                let hl = syntax::highlight_line(&self.file_matrix[row_idx], &ext, &mut hl_state);
+                highlighted_lines.push(hl);
+            } else {
+                highlighted_lines.push(Vec::new());
+            }
+        }
+
         for i in 0..content_rows {
             let screen_row = content_start_row + i;
             let file_row_idx = (file_matrix_row_start + i) as usize;
 
-            // 1) Line number part — single span
+            // 1) Line number — single span
             let line_nr_str: String = if (i as usize) < row_lines.len() {
                 row_lines[i as usize].iter().collect()
             } else {
@@ -214,27 +236,29 @@ impl Display {
                 &line_nr_str,
             );
 
-            // 2) Content part — build color spans
+            // 2) Content — syntax-colored spans
             let text_start_col = content_start + row_lines_length as u16;
             let text_width = content_w.saturating_sub(row_lines_length as u16) as usize;
+            let hl_idx = i as usize;
 
-            if file_row_idx < self.file_matrix.len() {
+            if file_row_idx < self.file_matrix.len() && hl_idx < highlighted_lines.len() {
                 let line = &self.file_matrix[file_row_idx];
+                let hl_line = &highlighted_lines[hl_idx];
                 let mut col = 0;
+
                 while col < text_width {
                     let file_col = self.initial_column as usize + col;
                     let ch = line.get(file_col).copied().unwrap_or(' ');
 
-                    let is_match = if search_len > 0 {
-                        self.is_search_match(line, file_col, &search_chars)
-                    } else {
-                        false
-                    };
+                    let is_match =
+                        search_len > 0 && self.is_search_match(line, file_col, &search_chars);
+
+                    let syntax_fg = hl_line.get(file_col).map(|c| c.fg).unwrap_or(fg_default);
 
                     let (fg, bg) = if is_match {
                         (fg_match, bg_match)
                     } else {
-                        (fg_text, bg_content)
+                        (syntax_fg, bg_content)
                     };
 
                     // Accumulate consecutive chars with same color
@@ -247,16 +271,17 @@ impl Display {
                         let next_file_col = self.initial_column as usize + col;
                         let next_ch = line.get(next_file_col).copied().unwrap_or(' ');
 
-                        let next_match = if search_len > 0 {
-                            self.is_search_match(line, next_file_col, &search_chars)
-                        } else {
-                            false
-                        };
+                        let next_match = search_len > 0
+                            && self.is_search_match(line, next_file_col, &search_chars);
+                        let next_syntax_fg = hl_line
+                            .get(next_file_col)
+                            .map(|c| c.fg)
+                            .unwrap_or(fg_default);
 
                         let (next_fg, next_bg) = if next_match {
                             (fg_match, bg_match)
                         } else {
-                            (fg_text, bg_content)
+                            (next_syntax_fg, bg_content)
                         };
 
                         if next_fg != fg || next_bg != bg {
@@ -370,7 +395,6 @@ impl Display {
             b: 220,
         };
 
-        // Build tab content and track active ranges
         let mut tab_str = String::new();
         let mut active_ranges: Vec<(usize, usize)> = vec![];
         let mut pos = 0;
@@ -384,14 +408,12 @@ impl Display {
             }
             tab_str.push_str(&tab_text);
             tab_str.push('│');
-            pos += tab_len + 1; // +1 for separator
+            pos += tab_len + 1;
         }
 
-        // Pad to fill width
         let tab_chars: Vec<char> = tab_str.chars().collect();
         let total_len = width as usize;
 
-        // Build spans: consecutive chars with same color
         let mut col = 0;
         while col < total_len {
             let is_active = active_ranges.iter().any(|(s, e)| col >= *s && col < *e);
@@ -412,7 +434,6 @@ impl Display {
                 span.push(ch);
                 col += 1;
             }
-
             Self::write_span(writer, start_col + span_start as u16, 0, fg, bg, &span);
         }
     }
@@ -432,7 +453,6 @@ impl Display {
         let padding = (width as usize).saturating_sub(left_part.len() + right_part.len());
         let status_line = format!("{}{}{}", left_part, " ".repeat(padding), right_part);
 
-        // Truncate or pad to exact width
         let status_chars: Vec<char> = status_line.chars().collect();
         let mut final_str = String::with_capacity(width as usize);
         for i in 0..width as usize {
@@ -516,16 +536,7 @@ impl Display {
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| sidebar.root_path.to_string_lossy().to_string())
         );
-        let mut header_padded = String::with_capacity(sw);
-        for (i, ch) in header_text.chars().enumerate() {
-            if i >= sw {
-                break;
-            }
-            header_padded.push(ch);
-        }
-        while header_padded.len() < sw {
-            header_padded.push(' ');
-        }
+        let header_padded = Self::pad_to_width(&header_text, sw);
         Self::write_span(writer, 0, 0, fg_header, bg_header, &header_padded);
 
         // Search bar at row 1 if active
@@ -533,16 +544,7 @@ impl Display {
 
         if sidebar.search_active {
             let search_display = format!(" / {}", sidebar.search_query);
-            let mut search_padded = String::with_capacity(sw);
-            for (i, ch) in search_display.chars().enumerate() {
-                if i >= sw {
-                    break;
-                }
-                search_padded.push(ch);
-            }
-            while search_padded.len() < sw {
-                search_padded.push(' ');
-            }
+            let search_padded = Self::pad_to_width(&search_display, sw);
             Self::write_span(writer, 0, 1, fg_search, bg_search, &search_padded);
         }
 
@@ -565,28 +567,15 @@ impl Display {
                 let is_selected = entry_idx == sidebar.selected_index;
 
                 let indent = "  ".repeat(entry.depth);
-                let icon = if entry.is_dir {
-                    if entry.expanded {
-                        "▼ "
-                    } else {
-                        "▶ "
-                    }
+                let line_text = if entry.is_dir {
+                    let dir_icon = if entry.expanded { "▼ " } else { "▶ " };
+                    format!(" {}{}{}", indent, dir_icon, entry.name)
                 } else {
-                    "  "
+                    let file_icon = syntax::file_icon(&entry.name);
+                    format!(" {}{} {}", indent, file_icon, entry.name)
                 };
-                let line_text = format!(" {}{}{}", indent, icon, entry.name);
 
-                // Pad or truncate to sidebar width
-                let mut padded = String::with_capacity(sw);
-                for (i, ch) in line_text.chars().enumerate() {
-                    if i >= sw {
-                        break;
-                    }
-                    padded.push(ch);
-                }
-                while padded.len() < sw {
-                    padded.push(' ');
-                }
+                let padded = Self::pad_to_width(&line_text, sw);
 
                 let bg = if is_selected { bg_selected } else { bg_sidebar };
                 let fg = if entry.is_dir { fg_dir } else { fg_file };
@@ -597,6 +586,16 @@ impl Display {
                 Self::write_span(writer, 0, screen_row, fg_file, bg_sidebar, &blank);
             }
         }
+    }
+
+    /// Pad or truncate a string to exact width
+    fn pad_to_width(text: &str, width: usize) -> String {
+        let chars: Vec<char> = text.chars().collect();
+        let mut result = String::with_capacity(width);
+        for i in 0..width {
+            result.push(chars.get(i).copied().unwrap_or(' '));
+        }
+        result
     }
 
     // --- Public API ---
@@ -624,11 +623,9 @@ impl Display {
 
     pub fn next_row(&mut self) {
         let content_rows = self.rows.saturating_sub(2);
-
         if self.initial_row >= (self.file_matrix.len() as u16).saturating_sub(content_rows) {
             return;
         }
-
         self.initial_row += 1;
     }
 
@@ -638,19 +635,15 @@ impl Display {
         }
     }
 
-    pub fn next_column(&mut self) {
+    pub fn next_column(&mut self, column_position: u16) {
         let content_w = self.content_width();
-        let (column_position, _) = cursor::position().unwrap();
-
         if column_position >= self.sidebar_width + content_w - 1 {
             self.initial_column += 1;
         }
     }
 
-    pub fn previous_column(&mut self) {
-        let (column_position, _) = cursor::position().unwrap();
+    pub fn previous_column(&mut self, column_position: u16) {
         let min_col = self.sidebar_width + self.offset_lines_number() as u16;
-
         if column_position <= min_col && self.initial_column > 0 {
             self.initial_column -= 1;
         }
@@ -659,36 +652,28 @@ impl Display {
     pub fn set_columns(&mut self, columns: u16) {
         self.columns = columns;
     }
-
     pub fn set_rows(&mut self, rows: u16) {
         self.rows = rows;
     }
-
     pub fn set_file_matrix(&mut self, file_matrix: Vec<Vec<char>>) {
         self.file_matrix = file_matrix;
     }
-
     pub fn set_mode(&mut self, mode: &str) {
         self.mode = String::from(mode);
     }
-
     pub fn set_modified(&mut self, modified: bool) {
         self.modified = modified;
     }
-
     pub fn set_cursor_info(&mut self, line: u16, column: u16) {
         self.cursor_line = line;
         self.cursor_column = column;
     }
-
     pub fn update_file_size(&mut self) {
         self.file_size = self.file_matrix.len();
     }
-
     pub fn reset_column(&mut self) {
         self.initial_column = 0;
     }
-
     pub fn reset_row(&mut self) {
         self.initial_row = 0;
     }
@@ -701,7 +686,6 @@ impl Display {
     pub fn set_initial_column(&mut self, column: u16) {
         self.initial_column = column;
     }
-
     pub fn set_initial_row(&mut self, row: u16) {
         self.initial_row = row;
     }
@@ -709,7 +693,6 @@ impl Display {
     pub fn get_cursor_position(&self) -> u16 {
         let column_position = cursor::position().unwrap().0;
         let row_lines_length = self.offset_lines_number() as u16;
-
         self.initial_column + column_position.saturating_sub(self.sidebar_width + row_lines_length)
     }
 
