@@ -2,12 +2,15 @@ use std::fs;
 use std::fs::File;
 use std::io::Read;
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct BufferFile {
     pub filename: String,
     pub file_matrix: Vec<Vec<char>>,
-    content: String,
+    pub modified: bool,
+    pub cursor_row: u16,
+    pub cursor_col: u16,
+    pub initial_row: u16,
+    pub initial_column: u16,
 }
 
 impl BufferFile {
@@ -20,7 +23,24 @@ impl BufferFile {
         BufferFile {
             filename: path.to_string(),
             file_matrix: BufferFile::get_file_matrix(&contents),
-            content: contents,
+            modified: false,
+            cursor_row: 0,
+            cursor_col: 0,
+            initial_row: 0,
+            initial_column: 0,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn new_empty(filename: &str) -> BufferFile {
+        BufferFile {
+            filename: filename.to_string(),
+            file_matrix: vec![vec![]],
+            modified: false,
+            cursor_row: 0,
+            cursor_col: 0,
+            initial_row: 0,
+            initial_column: 0,
         }
     }
 
@@ -36,6 +56,10 @@ impl BufferFile {
 
             matrix.push(row);
         });
+
+        if matrix.is_empty() {
+            matrix.push(vec![]);
+        }
 
         matrix
     }
@@ -54,6 +78,7 @@ impl BufferFile {
         } else {
             file_row.push(character);
         }
+        self.modified = true;
     }
 
     pub fn remove_char(&mut self, column: u16, row: u16) -> bool {
@@ -70,13 +95,14 @@ impl BufferFile {
             if col <= file_row.len() {
                 file_row.remove(col - 1);
             }
+            self.modified = true;
             false
         } else if absolute_row > 0 {
-            // Merge current line into previous line
             let current_line = self.file_matrix.remove(absolute_row);
             let previous_row = self.file_matrix.get_mut(absolute_row - 1).unwrap();
             previous_row.extend(current_line);
-            true // indicates a line merge happened
+            self.modified = true;
+            true
         } else {
             false
         }
@@ -99,9 +125,10 @@ impl BufferFile {
         };
 
         self.file_matrix.insert(absolute_row + 1, new_line);
+        self.modified = true;
     }
 
-    pub fn save(&self) -> std::io::Result<()> {
+    pub fn save(&mut self) -> std::io::Result<()> {
         let content: String = self
             .file_matrix
             .iter()
@@ -110,6 +137,7 @@ impl BufferFile {
             .join("\n");
 
         fs::write(&self.filename, content)?;
+        self.modified = false;
         Ok(())
     }
 
@@ -120,5 +148,12 @@ impl BufferFile {
         } else {
             0
         }
+    }
+
+    pub fn short_name(&self) -> String {
+        std::path::Path::new(&self.filename)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| self.filename.clone())
     }
 }
